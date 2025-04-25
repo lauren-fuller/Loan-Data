@@ -1,0 +1,182 @@
+---
+title: "Loan Data"
+output: html_document
+date: "2025-04-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(fastDummies)
+```
+
+## R Markdown
+
+```{r cars}
+file_path <- "/Users/laurenfuller/Desktop/LoanStats3a.csv"
+
+# Define the column names you want to keep
+selected_columns <- c("loan_status", "loan_amnt", "term", "addr_state","int_rate", "grade", "sub_grade", "emp_length",
+                      "home_ownership", "annual_inc", "verification_status",
+                      "pymnt_plan", "purpose", "dti", "delinq_2yrs",
+                      "inq_last_6mths", "pub_rec", "revol_util", "total_acc",
+                      "pub_rec_bankruptcies")
+
+# Read the CSV and keep only the selected columns
+df <- read_csv(file_path, col_select = all_of(selected_columns))
+df$int_rate <- substr(df$int_rate, 1, nchar(df$int_rate) - 1)
+df$int_rate <- as.numeric(df$int_rate) * .01
+
+df$revol_util <- substr(df$revol_util, 1, nchar(df$revol_util) - 1)
+df$revol_util <- as.numeric(df$revol_util) * .01
+
+#df
+```
+
+## How many unique values do we have in the categorical columns? We're going to get rid of the variables that have too many unique values.
+
+```{r unique values, echo=FALSE}
+# Loop through each column and print unique values
+# List of target columns
+cols <- c("loan_status","term", "addr_state", "grade", "sub_grade", "emp_length", "home_ownership",
+          "verification_status", "pymnt_plan", "purpose")
+
+df$loan_status <- case_when(
+  str_detect(df$loan_status, "Charged Off") ~ "Charged Off",
+  str_detect(df$loan_status, "Fully Paid") ~ "Fully Paid",
+  str_detect(df$loan_status, "Default") ~ "Default",
+  str_detect(df$loan_status, "Current") ~ "Current",
+  str_detect(df$loan_status, "In Grace Period") ~ "In Grace Period",
+  str_detect(df$loan_status, "Late") ~ "Late"
+  #TRUE ~ NA_character_ # Set all other statuses to NA
+)
+
+# Loop through and show value counts
+for (col in cols) {
+  cat("\nValue counts for", col, ":\n")
+  print(table(df[[col]]))
+}
+```
+
+## Drop sub_grade, get rid of rows that have N/A and blanks, consolidate categories in variables
+
+```{r categorical cleaning, echo=FALSE}
+#drop subgrade - too many variables
+df <- df %>% select(-sub_grade)
+
+#drop pymnt_plan - only 1 yes, the rest are no
+df <- df %>% select(-pymnt_plan)
+
+#remove rows with blanks & N/A
+  # First, replace blank strings with NA
+df[df == ""] <- NA
+
+  # Then, remove any rows with NA
+df <- na.omit(df)
+
+# Group emp_length into 4 sections
+df <- df %>% filter(emp_length != "n/a")
+df <- df %>%
+  mutate(emp_length = str_trim(emp_length)) %>%
+  mutate(emp_length = case_when(
+    emp_length %in% c("< 1 year", "1 year", "2 years", "3 years") ~ "0-3 years",
+    emp_length %in% c("4 years", "5 years", "6 years") ~ "4-6 years",
+    emp_length %in% c("7 years", "8 years", "9 years") ~ "7-9 years",
+    emp_length == "10+ years" ~ "10+ years",
+    TRUE ~ NA_character_
+  ))
+
+#consolidate state into 4 regions
+df <- df %>%
+  mutate(region = case_when(
+    addr_state %in% c("CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA") ~ "Northeast",
+    addr_state %in% c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "SD") ~ "Midwest",
+    addr_state %in% c("DE", "DC", "FL", "GA", "MD", "NC", "SC", "VA", "WV",
+                      "AL", "KY", "MS", "TN", "AR", "LA", "OK", "TX") ~ "South",
+    addr_state %in% c("AK", "AZ", "CA", "CO", "HI", "ID", "MT", "NV", "NM",
+                      "OR", "UT", "WA", "WY") ~ "West",
+    TRUE ~ NA_character_
+  ))
+df <- df %>% select(-addr_state)
+
+
+
+#remove rows where home_ownership is "NONE" or "OTHER" - there are only like 150/45000
+df <- df %>% filter(!(home_ownership %in% c("NONE", "OTHER")))
+
+#consolidate the purpose section into fewer categories
+df <- df %>%
+  mutate(purpose_group = case_when(
+    purpose %in% c("debt_consolidation", "credit_card") ~ "Debt",
+    purpose %in% c("home_improvement", "house", "moving") ~ "Home",
+    purpose %in% c("major_purchase", "car", "wedding", "vacation") ~ "Big Purchase",
+    purpose %in% c("medical", "other", "renewable_energy", "small_business", "educational") ~ "Medical/Other",
+    TRUE ~ NA_character_
+  ))
+
+#drop purpose - too many variables
+df <- df %>% select(-purpose)
+
+
+cols <- c("loan_status", "term", "region", "grade", "emp_length", "home_ownership",
+          "verification_status", "purpose_group")
+
+# Loop through and show value counts
+for (col in cols) {
+  cat("\nValue counts for", col, ":\n")
+  print(table(df[[col]]))
+}
+```
+
+``` {r dummy variables}
+df <- df %>%
+  fastDummies::dummy_cols(
+    select_columns = c("term", "region", "grade", "emp_length",
+                       "home_ownership", "verification_status", "purpose_group"),
+    remove_first_dummy = FALSE,       # keep all dummy variables
+    remove_selected_columns = TRUE    # drop the original columns
+  )
+
+```
+
+
+
+``` {r}
+df
+```
+
+## Create two dataframes and finalize df_loans to make model
+
+``` {r}
+# First group: loans with clear outcomes
+df_loans <- df %>%
+  filter(loan_status %in% c("Charged Off", "Default", "Fully Paid"))
+
+# Second group: loans still in progress or at risk
+df_predict <- df %>%
+  filter(loan_status %in% c("Current", "In Grace Period", "Late"))
+
+df_loans <- df %>%
+  filter(loan_status %in% c("Charged Off", "Default", "Fully Paid")) %>%
+  mutate(delinquent_loan = if_else(loan_status %in% c("Charged Off", "Default"), 1, 0))
+```
+
+
+
+``` {r}
+```
+
+
+``` {r}
+```
+
+
+
+
+``` {}
+```
+
+
+
+``` {}
+```
