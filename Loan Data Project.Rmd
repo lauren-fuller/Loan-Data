@@ -8,9 +8,14 @@ date: "2025-04-25"
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(fastDummies)
+library(smotefamily)
+library(caret)     # For model training and evaluation
+library(ROCR) 
+library(glmnet)
+
 ```
 
-## R Markdown
+## Load the Data
 
 ```{r cars}
 file_path <- "/Users/laurenfuller/Desktop/LoanStats3a.csv"
@@ -140,11 +145,6 @@ df <- df %>%
 ```
 
 
-
-``` {r}
-df
-```
-
 ## Create two dataframes and finalize df_loans to make model
 
 ``` {r}
@@ -158,10 +158,225 @@ df_predict <- df %>%
 
 df_loans <- df %>%
   filter(loan_status %in% c("Charged Off", "Default", "Fully Paid")) %>%
-  mutate(delinquent_loan = if_else(loan_status %in% c("Charged Off", "Default"), 1, 0))
+  mutate(unpaid_loan = if_else(loan_status %in% c("Charged Off", "Default"), 1, 0))
+
+df_loans <- df_loans %>% select(-loan_status)
+
+
+write.csv(df_loans, "/Users/laurenfuller/Desktop/df_loans.csv", row.names = FALSE)
+write.csv(df_predict, "/Users/laurenfuller/Desktop/df_predict.csv", row.names = FALSE)
+
+```
+
+# Logistc Regression
+
+## Handling Class Imbalances
+
+``` {r}
+# Bar plot of uneven class distribution bewtween unpaid and paid loans.
+# This is a problem because we want to be able to predict an unpaid loan, and there are far less of them then paid loans
+counts <- table(df_loans$unpaid_loan)
+colors <- c("lightblue", "salmon")
+
+par(mar = c(5, 4, 4, 8), xpd = TRUE)
+
+bp <- barplot(counts,
+        main = "Class Balance of Response Variable",
+        xlab = "Unpaid Loan Status",
+        ylab = "Count",
+        col = colors,
+        names.arg = c("Paid - 0", "Unpaid - 1"))
+
+text(x = bp, 
+     y = counts, 
+     label = counts, 
+     pos = 3,  # position 3 = above
+     cex = 0.8, 
+     col = "black")
+
+legend("topright",
+       inset = c(-0.15, 0),
+       legend = c("Paid - 0", "Unpaid - 1"),
+       fill = colors,
+       title = "Loan Status",
+       bty = "n")
+``` 
+## Balance the Data set using SMOTE
+
+``` {r}
+library(smotefamily)
+
+# Ensure the target variable is a factor for classification
+df_loans$unpaid_loan <- as.factor(df_loans$unpaid_loan)
+
+# Create the dataset X (features without target variable) and target (target variable)
+X <- df_loans[, -which(names(df_loans) == "unpaid_loan")]
+target <- df_loans$unpaid_loan
+
+# Balance the dataset using SMOTE (oversample minority class)
+balanced_df <- SMOTE(X = X, 
+                     target = target, 
+                     K = 5, 
+                     dup_size = 4)  # Duplication factor for synthetic instances
+
+# Check the structure of the balanced_df object
+#str(balanced_df)
+
+# Check if the target variable is included in the balanced dataset and inspect column names
+#names(balanced_df$data)
+
+table(balanced_df$data$class)
+```
+``` {r}
+# Bar plot of uneven class distribution bewtween unpaid and paid loans.
+# This is a problem because we want to be able to predict an unpaid loan, and there are far less of them then paid loans
+counts <- table(balanced_df$data$class)
+colors <- c("lightblue", "salmon")
+
+par(mar = c(5, 4, 4, 8), xpd = TRUE)
+
+bp <- barplot(counts,
+        main = "Class Balance of Response Variable - After SMOTE",
+        xlab = "Unpaid Loan Status",
+        ylab = "Count",
+        col = colors,
+        names.arg = c("Paid - 0", "Unpaid - 1"))
+
+text(x = bp, 
+     y = counts, 
+     label = counts, 
+     pos = 3,  # position 3 = above
+     cex = 0.8, 
+     col = "black")
+
+legend("topright",
+       inset = c(-0.25, 0),
+       legend = c("Paid - 0", "Unpaid - 1"),
+       fill = colors,
+       title = "Loan Status",
+       bty = "n")
+``` 
+
+
+``` {r}
+#standardize the data
+balanced_df$data <- balanced_df$data %>%
+  mutate(across(c(loan_amnt, int_rate, annual_inc, dti, delinq_2yrs, 
+                  inq_last_6mths, pub_rec, revol_util, total_acc, pub_rec_bankruptcies),
+                scale))
+
+# Ensure unpaid_loan is numeric (0 = paid, 1 = unpaid)
+colnames(balanced_df$data)[colnames(balanced_df$data) == "class"] <- "unpaid_loan"
+balanced_df$data$unpaid_loan <- as.numeric(balanced_df$data$unpaid_loan)
+
+# 1. Split into train/test
+set.seed(123)  # for reproducibility
+sample_index <- sample(1:nrow(balanced_df$data), 0.7 * nrow(balanced_df$data))  # 70% training
+train_data <- balanced_df$data[sample_index, ]
+test_data <- balanced_df$data[-sample_index, ]
+
+# 2. Fit logistic regression on train
+log_base_model <- glm(unpaid_loan ~ ., data = train_data, family = "binomial")
+
+summary(log_base_model)
+
+# 3. Predict on test
+test_data$predicted_prob <- predict(log_base_model, newdata = test_data, type = "response")
+test_data$predicted_class <- ifelse(test_data$predicted_prob > 0.5, 1, 0)
+
+# 4. Evaluate
+table(Predicted = test_data$predicted_class, Actual = test_data$unpaid_loan)
+confusionMatrix(as.factor(test_data$predicted_class), as.factor(test_data$unpaid_loan))
+
+```
+
+# Logistic LASSO - glmnet apparently already does standardization
+``` {r}
+# Make sure your training features are a matrix
+x_train <- as.matrix(train_data %>% select(-unpaid_loan))
+y_train <- train_data$unpaid_loan
+
+x_test <- as.matrix(test_data %>% select(-unpaid_loan, -predicted_prob, -predicted_class))
+y_test <- test_data$unpaid_loan
+
+
+# Fit LASSO Logistic Regression
+set.seed(123)
+lasso_model <- glmnet(x_train, y_train, 
+                      family = "binomial", 
+                      alpha = 1)  # alpha = 1 means LASSO
+
+# Plot the coefficient paths
+plot(lasso_model, xvar = "lambda")
+
+# Cross-validation to find the best lambda
+set.seed(123)
+cv_lasso <- cv.glmnet(x_train, y_train, 
+                      family = "binomial", 
+                      alpha = 1, 
+                      type.measure = "class")
+
+# Plot CV curve
+plot(cv_lasso)
+
+# Best lambda
+best_lambda <- cv_lasso$lambda.min
+best_lambda
+
+# Fit final model at best lambda
+best_lasso_model <- glmnet(x_train, y_train, 
+                            family = "binomial", 
+                            alpha = 1, 
+                            lambda = best_lambda)
+
+# Coefficients
+coef(best_lasso_model)
+
+# Predict on test data
+predicted_prob <- predict(best_lasso_model, s = best_lambda, newx = x_test, type = "response")
+predicted_class <- ifelse(predicted_prob > 0.5, 1, 0)
+
+# Evaluate
+table(Predicted = predicted_class, Actual = y_test)
+confusionMatrix(as.factor(predicted_class), as.factor(y_test))
+
 ```
 
 
+# Compare models
+``` {r}
+# Compare base logistic and lasso logistic model performance
+
+# 1. Confusion matrix for base logistic regression
+conf_matrix_base <- confusionMatrix(as.factor(test_data$predicted_class), as.factor(test_data$unpaid_loan))
+
+# 2. Confusion matrix for LASSO model
+conf_matrix_lasso <- confusionMatrix(as.factor(predicted_class), as.factor(y_test))
+
+# 3. Extract relevant metrics
+metrics_comparison <- tibble(
+  Metric = c("Accuracy", "Sensitivity (Recall)", "Specificity"),
+  Logistic_Regression = c(
+    conf_matrix_base$overall["Accuracy"],
+    conf_matrix_base$byClass["Sensitivity"],
+    conf_matrix_base$byClass["Specificity"]
+  ),
+  LASSO_Regression = c(
+    conf_matrix_lasso$overall["Accuracy"],
+    conf_matrix_lasso$byClass["Sensitivity"],
+    conf_matrix_lasso$byClass["Specificity"]
+  )
+)
+
+# 4. Show side-by-side
+print(metrics_comparison)
+
+```
+
+
+
+``` {r}
+```
 
 ``` {r}
 ```
@@ -171,12 +386,13 @@ df_loans <- df %>%
 ```
 
 
+``` {r}
+```
 
+``` {r}
+```
 
-``` {}
+``` {r}
 ```
 
 
-
-``` {}
-```
